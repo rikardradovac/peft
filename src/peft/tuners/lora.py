@@ -345,8 +345,11 @@ class LoraModel(torch.nn.Module):
             except AttributeError:
                 continue
             if isinstance(target, LoraLayer):
-                bias = target.bias is not None
-                new_module = torch.nn.Linear(target.in_features, target.out_features, bias=bias)
+                if hasattr(target, "bias"):
+                    bias = target.bias is not None
+                    new_module = torch.nn.Linear(target.in_features, target.out_features, bias=bias)
+                else:
+                    new_module = torch.nn.Embedding(target.in_features, target.out_features)
                 target.merge()
                 self._replace_module(parent, target_name, new_module, target)
 
