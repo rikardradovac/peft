@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
+from torch.fx import GraphModule
+from torch.ao.nn.quantized.dynamic.modules.linear import Linear as QuantLinear
+from torch.ao.nn.quantized import Embedding as QuantEmbedding
 import re
 import warnings
 from dataclasses import asdict, dataclass, field
@@ -218,13 +221,29 @@ class LoraModel(torch.nn.Module):
                         new_module = Linear8bitLt(
                             adapter_name, target.in_features, target.out_features, bias=bias, **eightbit_kwargs
                         )
+                    
                     elif isinstance(target, torch.nn.Embedding):
+                        embedding_kwargs = kwargs.copy()
+                        embedding_kwargs.pop("fan_in_fan_out", None)
+                        in_features, out_features = target.num_embeddings, target.embedding_dim
+                        new_module = Embedding(adapter_name, in_features, out_features, **embedding_kwargs)
+                    
+                    elif isinstance(target, GraphModule) and isinstance(target.module, QuantEmbedding):
                         embedding_kwargs = kwargs.copy()
                         embedding_kwargs.pop("fan_in_fan_out", None)
                         in_features, out_features = target.num_embeddings, target.embedding_dim
                         new_module = Embedding(adapter_name, in_features, out_features, **embedding_kwargs)
                     else:
                         if isinstance(target, torch.nn.Linear):
+                            in_features, out_features = target.in_features, target.out_features
+                            if kwargs["fan_in_fan_out"]:
+                                warnings.warn(
+                                    "fan_in_fan_out is set to True but the target module is `torch.nn.Linear`. "
+                                    "Setting fan_in_fan_out to False."
+                                )
+                                kwargs["fan_in_fan_out"] = lora_config.fan_in_fan_out = False
+                        elif isinstance(target, GraphModule) and isinstance(target.module, QuantLinear):
+                            bias = target.module.bias
                             in_features, out_features = target.in_features, target.out_features
                             if kwargs["fan_in_fan_out"]:
                                 warnings.warn(
@@ -258,7 +277,7 @@ class LoraModel(torch.nn.Module):
 
     def _replace_module(self, parent_module, child_name, new_module, old_module):
         setattr(parent_module, child_name, new_module)
-        new_module.weight = old_module.weight
+        new_module.weight = torch.nn.Parameter(old_module.weight.dequantize())
         if hasattr(old_module, "bias"):
             if old_module.bias is not None:
                 new_module.bias = old_module.bias
