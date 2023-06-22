@@ -211,6 +211,8 @@ class LoraModel(torch.nn.Module):
         is_using_layer_indexes = getattr(lora_config, "layers_to_transform", None) is not None
         layer_indexing_pattern = getattr(lora_config, "layers_pattern", None)
 
+        pytorch = False
+
         for key in key_list:
             if isinstance(lora_config.target_modules, str):
                 target_module_found = re.fullmatch(lora_config.target_modules, key)
@@ -286,6 +288,7 @@ class LoraModel(torch.nn.Module):
                         embedding_kwargs.pop("fan_in_fan_out", None)
                         in_features, out_features = target.num_embeddings, target.embedding_dim
                         new_module = Embedding(adapter_name, in_features, out_features, **embedding_kwargs)
+                    
                     else:
                         if isinstance(target, torch.nn.Linear):
                             in_features, out_features = target.in_features, target.out_features
@@ -304,6 +307,16 @@ class LoraModel(torch.nn.Module):
                                     "Setting fan_in_fan_out to False."
                                 )
                                 kwargs["fan_in_fan_out"] = lora_config.fan_in_fan_out = False
+                        elif isinstance(target, torch.ao.nn.quantized.dynamic.Linear):
+                            bias = target.bias()
+                            in_features, out_features = target.in_features, target.out_features
+                            if kwargs["fan_in_fan_out"]:
+                                warnings.warn(
+                                    "fan_in_fan_out is set to True but the target module is `torch.nn.Linear`. "
+                                    "Setting fan_in_fan_out to False."
+                                )
+                                kwargs["fan_in_fan_out"] = lora_config.fan_in_fan_out = False
+                            pytorch = True
                         elif isinstance(target, Conv1D):
                             in_features, out_features = (
                                 target.weight.ds_shape if hasattr(target.weight, "ds_shape") else target.weight.shape
@@ -321,19 +334,26 @@ class LoraModel(torch.nn.Module):
                             )
                         new_module = Linear(adapter_name, in_features, out_features, bias=bias, **kwargs)
 
-                    self._replace_module(parent, target_name, new_module, target)
+                    self._replace_module(parent, target_name, new_module, target,  pytorch=pytorch)
         if not is_target_modules_in_base_model:
             raise ValueError(
                 f"Target modules {lora_config.target_modules} not found in the base model. "
                 f"Please check the target modules and try again."
             )
 
-    def _replace_module(self, parent_module, child_name, new_module, old_module):
+    def _replace_module(self, parent_module, child_name, new_module, old_module, pytorch=False):
         setattr(parent_module, child_name, new_module)
-        new_module.weight = torch.nn.Parameter(old_module.weight.dequantize())
+        if pytorch:
+            new_module.weight = torch.nn.Parameter(old_module.weight().dequantize())
+        else:
+            new_module.weight = torch.nn.Parameter(old_module.weight.dequantize())
         if hasattr(old_module, "bias"):
+            
             if old_module.bias is not None:
-                new_module.bias = old_module.bias
+                if pytorch:
+                    new_module.bias = nn.Parameter(old_module.bias())
+                else:
+                    new_module.bias = old_module.bias
 
         if getattr(old_module, "state", None) is not None:
             new_module.state = old_module.state
@@ -342,7 +362,11 @@ class LoraModel(torch.nn.Module):
         # dispatch to correct device
         for name, module in new_module.named_modules():
             if "lora_" in name:
-                module.to(old_module.weight.device)
+                if pytorch:
+                
+                    module.to(old_module.weight().device)
+                else:
+                    module.to(old_module.weight.device)
 
     def __getattr__(self, name: str):
         """Forward missing attributes to the wrapped module."""
@@ -580,6 +604,7 @@ class Linear(nn.Linear, LoraLayer):
     ):
         init_lora_weights = kwargs.pop("init_lora_weights", True)
 
+        kwargs["bias"] = True
         nn.Linear.__init__(self, in_features, out_features, **kwargs)
         LoraLayer.__init__(self, in_features=in_features, out_features=out_features)
         # Freezing the pre-trained weight matrix
